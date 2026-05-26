@@ -55,7 +55,7 @@ function startBot(id) {
   bots[id].bot = mineflayer.createBot({
     host: 'donutsmp.net',
     port: 25565,
-    version: '1.20.1',
+    version: '1.20.2',
     auth: 'microsoft',
     profilesFolder: TOKENS_DIR,
     username: id,
