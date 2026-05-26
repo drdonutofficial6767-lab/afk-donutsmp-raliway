@@ -2,10 +2,10 @@ const https = require('https')
 const fs = require('fs')
 const path = require('path')
 
-const CLIENT_ID = '00000000402b5328' // Client ID officiel Minecraft
+const CLIENT_ID = '00000000402b5328'
 const TOKENS_DIR = process.env.TOKENS_DIR || path.join(__dirname, 'tokens')
 
-const pendingAuths = {} // { accountId: { code, link, expiresAt, interval } }
+const pendingAuths = {}
 
 function post(hostname, path, data) {
   return new Promise((resolve, reject) => {
@@ -32,55 +32,45 @@ function post(hostname, path, data) {
 }
 
 async function startAuth(accountId) {
-  // Annule une auth en cours si elle existe
   if (pendingAuths[accountId]) cancelAuth(accountId)
 
-  // Étape 1 : demande un device code à Microsoft
   const deviceRes = await post('login.microsoftonline.com',
     '/consumers/oauth2/v2.0/devicecode', {
       client_id: CLIENT_ID,
       scope: 'XboxLive.signin offline_access'
     })
 
-  if (!deviceRes.device_code) throw new Error('Impossible de contacter Microsoft')
-
-  const expiresAt = Date.now() + (deviceRes.expires_in * 1000)
-
-  pendingAuths[accountId] = {
-    deviceCode: deviceRes.device_code,
-    userCode: deviceRes.user_code,
-    link: deviceRes.verification_uri || 'https://microsoft.com/devicelogin',
-    expiresAt,
-    interval: null,
-    status: 'pending',
-    token: null
+  if (!deviceRes.device_code) {
+    throw new Error('Impossible de générer le code auprès de Microsoft.')
   }
 
-  // Étape 2 : polling toutes les 5 secondes
-  pendingAuths[accountId].interval = setInterval(async () => {
-    if (!pendingAuths[accountId]) return
+  pendingAuths[accountId] = {
+    status: 'pending',
+    userCode: deviceRes.user_code,
+    link: deviceRes.verification_uri,
+    expiresAt: Date.now() + (deviceRes.expires_in * 1000),
+    interval: null
+  }
 
-    // Vérifie si expiré
-    if (Date.now() > pendingAuths[accountId].expiresAt) {
-      pendingAuths[accountId].status = 'expired'
-      cancelAuth(accountId)
+  pendingAuths[accountId].interval = setInterval(async () => {
+    if (!pendingAuths[accountId] || Date.now() > pendingAuths[accountId].expiresAt) {
+      if (pendingAuths[accountId]) pendingAuths[accountId].status = 'expired'
+      clearInterval(pendingAuths[accountId]?.interval)
       return
     }
 
     try {
       const tokenRes = await post('login.microsoftonline.com',
         '/consumers/oauth2/v2.0/token', {
-          client_id: CLIENT_ID,
           grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-          device_code: pendingAuths[accountId].deviceCode
+          client_id: CLIENT_ID,
+          device_code: deviceRes.device_code
         })
 
       if (tokenRes.access_token) {
-        // Authentifié ! Sauvegarde le token
         pendingAuths[accountId].status = 'success'
         clearInterval(pendingAuths[accountId].interval)
 
-        // S'assure que le dossier existe (important sur Railway)
         if (!fs.existsSync(TOKENS_DIR)) fs.mkdirSync(TOKENS_DIR, { recursive: true })
 
         const tokenFile = path.join(TOKENS_DIR, `${accountId}.json`)
@@ -90,9 +80,9 @@ async function startAuth(accountId) {
           expires_at: Date.now() + (tokenRes.expires_in * 1000)
         }))
 
-        setTimeout(() => { delete pendingAuths[accountId] }, 10000)
+        // Conservé 60 secondes en mémoire au lieu de 10 pour laisser le temps au web d'être notifié
+        setTimeout(() => { delete pendingAuths[accountId] }, 60000)
       }
-      // Si authorization_pending, on continue de poller
     } catch {}
   }, 5000)
 
@@ -121,9 +111,4 @@ function cancelAuth(accountId) {
   }
 }
 
-function hasToken(accountId) {
-  const tokenFile = path.join(TOKENS_DIR, `${accountId}.json`)
-  return fs.existsSync(tokenFile)
-}
-
-module.exports = { startAuth, getAuthStatus, cancelAuth, hasToken }
+module.exports = { startAuth, getAuthStatus, cancelAuth }
