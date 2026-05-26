@@ -23,14 +23,14 @@ function setAuthFailed(id, reason) {
 
 async function startAuth(accountId) {
   const botManager = require('./botManager')
-  authStates[accountId] = { status: 'connecting' }
   
-  // Force le démarrage pour générer le code MSA
+  authStates[accountId] = { status: 'connecting' }
   botManager.startBot(accountId)
   
-  await new Promise(resolve => setTimeout(resolve, 2000))
-  const current = authStates[accountId]
+  // Petite attente pour laisser Mineflayer générer le code
+  await new Promise(resolve => setTimeout(resolve, 1500))
   
+  const current = authStates[accountId]
   if (current && current.status === 'pending') {
     return {
       code: current.code,
@@ -38,7 +38,7 @@ async function startAuth(accountId) {
       expiresIn: Math.max(0, Math.floor((current.expiresAt - Date.now()) / 1000))
     }
   }
-  return { code: null, link: 'https://microsoft.com/link', expiresIn: 0 }
+  return { code: current?.code || null, link: 'https://microsoft.com/link', expiresIn: 300 }
 }
 
 function getAuthStatus(accountId) {
