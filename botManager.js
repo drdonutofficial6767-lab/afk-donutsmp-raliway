@@ -27,113 +27,177 @@ function getAll() {
 
 function addAccount(id, name) {
   if (bots[id]) return
-  bots[id] = { bot: null, status: 'stopped', logs: [], name, reconnectTimer: null, afkStatus: 'idle' }
+  bots[id] = { bot: null, status: 'stopped', logs: [], name, reconnectTimer: null, afkStatus: 'idle', intervals: [] }
 }
 
 function removeAccount(id) {
   stopBot(id)
   delete bots[id]
+  if (fs.existsSync(TOKENS_DIR)) {
+    const files = fs.readdirSync(TOKENS_DIR)
+    files.forEach(file => {
+      if (file.toLowerCase().includes(id.toLowerCase())) {
+        try { fs.unlinkSync(path.join(TOKENS_DIR, file)) } catch {}
+      }
+    })
+  }
 }
 
 function startBot(id) {
-  if (!bots[id] || bots[id].status === 'connected') return
-
-  if (bots[id].reconnectTimer) {
-    clearTimeout(bots[id].reconnectTimer)
-    bots[id].reconnectTimer = null
-  }
+  if (!bots[id] || bots[id].bot) return
+  if (bots[id].reconnectTimer) { clearTimeout(bots[id].reconnectTimer); bots[id].reconnectTimer = null }
 
   bots[id].status = 'connecting'
   addLog(id, '🔄 Connexion à DonutSMP...')
 
-  const tokenFile = path.join(TOKENS_DIR, `${id}.json`)
-  let authOption = 'microsoft'
+  const authManager = require('./authManager')
 
-  if (fs.existsSync(tokenFile)) {
-    try {
-      const tokenData = JSON.parse(fs.readFileSync(tokenFile, 'utf-8'))
-      authOption = {
-        client_id: '00000000402b5328',
-        access_token: tokenData.access_token,
-        refresh_token: tokenData.refresh_token,
-        expires_at: tokenData.expires_at
-      }
-      addLog(id, '🔑 Session Microsoft locale trouvée et chargée.')
-    } catch (e) {
-      addLog(id, '⚠️ Session corrompue, connexion classique requise.')
-    }
-  }
-
-  const bot = mineflayer.createBot({
-    host: 'donutsmp.net', 
+  bots[id].bot = mineflayer.createBot({
+    host: 'donutsmp.net',
     port: 25565,
-    username: bots[id].name,
-    auth: authOption,
-    version: '1.20.2', // Forcé pour éviter les soucis de protocoles
-    hideErrors: true
+    version: '1.20.1',
+    auth: 'microsoft',
+    profilesFolder: TOKENS_DIR,
+    username: id,
+    hideErrors: true,
+    onMsaCode: (data) => {
+      addLog(id, `🔑 [Auth Microsoft] Code requis : ${data.user_code}`)
+      authManager.setPendingAuth(id, data)
+    }
   })
 
-  bots[id].bot = bot
-
-  bot.on('login', () => {
+  // FIX : On utilise 'login' (une seule fois) à la place de 'spawn' pour éviter d'empiler les anti-AFK
+  bots[id].bot.on('login', () => {
     bots[id].status = 'connected'
-    addLog(id, `✅ Connecté au serveur en tant que ${bot.username}`)
+    addLog(id, `✅ ${bots[id].name} connecté avec succès !`)
+    authManager.setAuthSuccess(id)
     startAntiAFK(id)
   })
 
-  bot.on('end', (reason) => {
-    bots[id].status = 'stopped'
-    addLog(id, `❌ Déconnecté : ${reason}`)
-    // Reconnexion auto après 15 secondes si pas stoppé à la main
-    if (bots[id] && bots[id].status !== 'stopped') {
-      addLog(id, '⏳ Tentative de reconnexion dans 15s...')
-      bots[id].reconnectTimer = setTimeout(() => startBot(id), 15000)
+  bots[id].bot.on('windowOpen', async (window) => {
+    if (bots[id].afkStatus !== 'searching') return
+
+    addLog(id, `📦 Menu AFK détecté (Slot ${AFK_BUTTON_SLOT}) — Clic...`)
+    freezeBot(id)
+    bots[id].afkStatus = 'teleporting'
+
+    setTimeout(async () => {
+      try {
+        if (bots[id] && bots[id].bot) {
+          // FIX : Utilisation de clickWindow natif (simpleClick n'existe pas)
+          await bots[id].bot.clickWindow(AFK_BUTTON_SLOT, 0, 0)
+          addLog(id, `⏳ Téléportation lancée — Immobile pendant 6s...`)
+        }
+
+        setTimeout(() => {
+          if (bots[id] && bots[id].afkStatus === 'teleporting') {
+            unfreezeBot(id)
+            bots[id].afkStatus = 'idle'
+            addLog(id, `✅ Statut AFK synchronisé.`)
+          }
+        }, 6000)
+
+      } catch (e) {
+        addLog(id, `⚠️ Erreur lors du clic : ${e.message}`)
+        unfreezeBot(id)
+        bots[id].afkStatus = 'idle'
+      }
+    }, 500)
+  })
+
+  bots[id].bot.on('message', (jsonMsg) => {
+    const msg = jsonMsg.toString().toLowerCase()
+    if (bots[id].afkStatus === 'teleporting' && (msg.includes('region is full') || msg.includes('area is full'))) {
+      addLog(id, `❌ Zone AFK saturée.`)
+      unfreezeBot(id)
+      bots[id].afkStatus = 'idle'
     }
   })
 
-  bot.on('error', (err) => {
-    addLog(id, `⚠️ Erreur : ${err.message}`)
+  bots[id].bot.on('kicked', (reason) => {
+    cleanBotResources(id)
+    addLog(id, `❌ Expulsé : ${reason}`)
+    handleReconnect(id)
   })
+
+  bots[id].bot.on('error', (err) => {
+    cleanBotResources(id)
+    addLog(id, `⚠️ Erreur réseau : ${err.message}`)
+    handleReconnect(id)
+  })
+
+  bots[id].bot.on('end', () => {
+    if (bots[id] && bots[id].status === 'stopped') return
+    cleanBotResources(id)
+    addLog(id, '🔌 Connexion interrompue.')
+    handleReconnect(id)
+  })
+}
+
+function handleReconnect(id) {
+  if (!bots[id] || bots[id].status === 'stopped') return
+  bots[id].status = 'disconnected'
+  bots[id].reconnectTimer = setTimeout(() => startBot(id), 10000)
+  addLog(id, '🔄 Reconnexion automatique programmée dans 10s...')
+}
+
+function cleanBotResources(id) {
+  if (!bots[id]) return
+  if (bots[id].intervals) {
+    bots[id].intervals.forEach(clearInterval)
+    bots[id].intervals = []
+  }
+  bots[id].afkStatus = 'idle'
+  bots[id].bot = null
 }
 
 function stopBot(id) {
-  if (!bots[id] || !bots[id].bot) return
-  
-  if (bots[id].reconnectTimer) {
-    clearTimeout(bots[id].reconnectTimer)
-    bots[id].reconnectTimer = null
+  if (!bots[id]) return
+  if (bots[id].reconnectTimer) { clearTimeout(bots[id].reconnectTimer); bots[id].reconnectTimer = null }
+  bots[id].status = 'stopped'
+  if (bots[id].bot) {
+    try { bots[id].bot.quit() } catch {}
   }
-
-  addLog(id, '🛑 Déconnexion propre demandée...')
-  try {
-    bots[id].bot.chat('/quit') // Quitte proprement si le serveur le gère
-  } catch {}
-  
-  setTimeout(() => {
-    if (bots[id] && bots[id].bot) {
-      bots[id].bot.quit()
-      bots[id].status = 'stopped'
-      bots[id].afkStatus = 'idle'
-      addLog(id, '🗑️ Session réseau fermée.')
-    }
-  }, 500)
+  cleanBotResources(id)
+  bots[id].status = 'stopped'
+  addLog(id, '🛑 Bot mis à l\'arrêt.')
 }
 
 function startAntiAFK(id) {
-  // Saut toutes les 30s
-  setInterval(() => {
+  if (!bots[id]) return
+  cleanBotResources(id)
+
+  // Saut (30s)
+  const jump = setInterval(() => {
     if (bots[id] && bots[id].bot && bots[id].status === 'connected' && bots[id].afkStatus === 'idle') {
       bots[id].bot.setControlState('jump', true)
       setTimeout(() => { if (bots[id] && bots[id].bot) bots[id].bot.setControlState('jump', false) }, 500)
     }
   }, 30000)
 
-  // Mouvement de tête toutes les 3 min
-  setInterval(() => {
+  // Regard (3m)
+  const look = setInterval(() => {
     if (bots[id] && bots[id].bot && bots[id].status === 'connected' && bots[id].afkStatus === 'idle') {
-      bots[id].bot.look(bots[id].bot.entity.yaw + 0.5, 0)
+      try { bots[id].bot.look(bots[id].bot.entity.yaw + 0.5, 0) } catch {}
     }
   }, 180000)
+
+  bots[id].intervals.push(jump, look)
+}
+
+function freezeBot(id) {
+  if (!bots[id] || !bots[id].bot) return
+  const b = bots[id].bot
+  ;['forward','back','left','right','jump','sneak','sprint'].forEach(s => { try { b.setControlState(s, false) } catch {} })
+}
+
+function unfreezeBot(id) { freezeBot(id) }
+
+function findAfk(id) {
+  if (!bots[id] || bots[id].status !== 'connected') return
+  bots[id].afkStatus = 'searching'
+  addLog(id, '🔍 Commande /afk envoyée...')
+  bots[id].bot.chat('/afk')
 }
 
 function goHome(id, num) {
@@ -142,24 +206,4 @@ function goHome(id, num) {
   addLog(id, `🏠 Commande envoyée : /home ${num}`)
 }
 
-// FIX DE LA SUBTILITÉ FIND AFK : On force l'ouverture
-function findAfk(id) {
-  if (!bots[id] || !bots[id].bot || bots[id].status !== 'connected') return
-  
-  addLog(id, "🔄 Activation du mode AFK (Ouverture du menu...)")
-  bots[id].bot.chat('/afk') // Force l'ouverture du menu AFK de DonutSMP
-  
-  // On attend 1,5 seconde que le menu s'ouvre avant de cliquer sur le slot
-  setTimeout(() => {
-    if (bots[id] && bots[id].bot) {
-      try {
-        bots[id].bot.clickWindow(AFK_BUTTON_SLOT, 0, 0)
-        addLog(id, "🎯 Clic sur 'TP vers AFK libre' effectué.")
-      } catch (e) {
-        addLog(id, "⚠️ Impossible de cliquer (Le menu ne s'est pas ouvert à temps)")
-      }
-    }
-  }, 1500)
-}
-
-module.exports = { getTokensDir, getAll, addAccount, removeAccount, startBot, stopBot, goHome, findAfk }
+module.exports = { addAccount, removeAccount, startBot, stopBot, getAll, findAfk, goHome, getTokensDir }
