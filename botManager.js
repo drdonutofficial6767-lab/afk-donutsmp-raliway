@@ -55,7 +55,7 @@ function startBot(id) {
   bots[id].bot = mineflayer.createBot({
     host: 'donutsmp.net',
     port: 25565,
-    version: '1.20.2',
+    version: '1.20.2', // Changé en 1.20.2 pour DonutSMP
     auth: 'microsoft',
     profilesFolder: TOKENS_DIR,
     username: id,
@@ -66,7 +66,6 @@ function startBot(id) {
     }
   })
 
-  // FIX : On utilise 'login' (une seule fois) à la place de 'spawn' pour éviter d'empiler les anti-AFK
   bots[id].bot.on('login', () => {
     bots[id].status = 'connected'
     addLog(id, `✅ ${bots[id].name} connecté avec succès !`)
@@ -84,11 +83,9 @@ function startBot(id) {
     setTimeout(async () => {
       try {
         if (bots[id] && bots[id].bot) {
-          // FIX : Utilisation de clickWindow natif (simpleClick n'existe pas)
           await bots[id].bot.clickWindow(AFK_BUTTON_SLOT, 0, 0)
           addLog(id, `⏳ Téléportation lancée — Immobile pendant 6s...`)
         }
-
         setTimeout(() => {
           if (bots[id] && bots[id].afkStatus === 'teleporting') {
             unfreezeBot(id)
@@ -96,7 +93,6 @@ function startBot(id) {
             addLog(id, `✅ Statut AFK synchronisé.`)
           }
         }, 6000)
-
       } catch (e) {
         addLog(id, `⚠️ Erreur lors du clic : ${e.message}`)
         unfreezeBot(id)
@@ -167,7 +163,6 @@ function startAntiAFK(id) {
   if (!bots[id]) return
   cleanBotResources(id)
 
-  // Saut (30s)
   const jump = setInterval(() => {
     if (bots[id] && bots[id].bot && bots[id].status === 'connected' && bots[id].afkStatus === 'idle') {
       bots[id].bot.setControlState('jump', true)
@@ -175,7 +170,6 @@ function startAntiAFK(id) {
     }
   }, 30000)
 
-  // Regard (3m)
   const look = setInterval(() => {
     if (bots[id] && bots[id].bot && bots[id].status === 'connected' && bots[id].afkStatus === 'idle') {
       try { bots[id].bot.look(bots[id].bot.entity.yaw + 0.5, 0) } catch {}
@@ -206,4 +200,12 @@ function goHome(id, num) {
   addLog(id, `🏠 Commande envoyée : /home ${num}`)
 }
 
-module.exports = { addAccount, removeAccount, startBot, stopBot, getAll, findAfk, goHome, getTokensDir }
+// Fonction pour envoyer n'importe quelle commande depuis la page web
+function sendCustomCommand(id, cmd) {
+  if (bots[id] && bots[id].bot && bots[id].status === 'connected') {
+    bots[id].bot.chat(cmd)
+    addLog(id, `💬 Commande envoyée : ${cmd}`)
+  }
+}
+
+module.exports = { addAccount, removeAccount, startBot, stopBot, getAll, findAfk, goHome, getTokensDir, sendCustomCommand }
