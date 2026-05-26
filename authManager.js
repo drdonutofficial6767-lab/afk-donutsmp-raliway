@@ -1,114 +1,209 @@
-const https = require('https')
+const mineflayer = require('mineflayer')
 const fs = require('fs')
 const path = require('path')
 
-const CLIENT_ID = '00000000402b5328'
 const TOKENS_DIR = process.env.TOKENS_DIR || path.join(__dirname, 'tokens')
+if (!fs.existsSync(TOKENS_DIR)) fs.mkdirSync(TOKENS_DIR, { recursive: true })
 
-const pendingAuths = {}
+const bots = {}
+const AFK_BUTTON_SLOT = 49
 
-function post(hostname, path, data) {
-  return new Promise((resolve, reject) => {
-    const body = new URLSearchParams(data).toString()
-    const options = {
-      hostname, path, method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': Buffer.byteLength(body)
+function getTokensDir() { return TOKENS_DIR }
+
+function addLog(id, msg) {
+  if (!bots[id]) return
+  const time = new Date().toLocaleTimeString('fr-FR')
+  const entry = `[${time}] ${msg}`
+  bots[id].logs.push(entry)
+  if (bots[id].logs.length > 100) bots[id].logs.shift()
+  console.log(`[${id}] ${entry}`)
+}
+
+function getAll() {
+  return Object.entries(bots).map(([id, b]) => ({
+    id, name: b.name, status: b.status, logs: b.logs, afkStatus: b.afkStatus
+  }))
+}
+
+function addAccount(id, name) {
+  if (bots[id]) return
+  bots[id] = { bot: null, status: 'stopped', logs: [], name, reconnectTimer: null, afkStatus: 'idle', intervals: [] }
+}
+
+function removeAccount(id) {
+  stopBot(id)
+  delete bots[id]
+  if (fs.existsSync(TOKENS_DIR)) {
+    const files = fs.readdirSync(TOKENS_DIR)
+    files.forEach(file => {
+      if (file.toLowerCase().includes(id.toLowerCase())) {
+        try { fs.unlinkSync(path.join(TOKENS_DIR, file)) } catch {}
       }
-    }
-    const req = https.request(options, res => {
-      let raw = ''
-      res.on('data', d => raw += d)
-      res.on('end', () => {
-        try { resolve(JSON.parse(raw)) }
-        catch { resolve({}) }
-      })
     })
-    req.on('error', reject)
-    req.write(body)
-    req.end()
+  }
+}
+
+function startBot(id) {
+  if (!bots[id] || bots[id].bot) return
+  if (bots[id].reconnectTimer) { clearTimeout(bots[id].reconnectTimer); bots[id].reconnectTimer = null }
+
+  bots[id].status = 'connecting'
+  addLog(id, '🔄 Connexion à DonutSMP...')
+
+  const authManager = require('./authManager')
+
+  bots[id].bot = mineflayer.createBot({
+    host: 'donutsmp.net',
+    port: 25565,
+    version: '1.20.1',
+    auth: 'microsoft',
+    profilesFolder: TOKENS_DIR,
+    username: id,
+    hideErrors: true,
+    onMsaCode: (data) => {
+      addLog(id, `🔑 [Auth Microsoft] Code requis : ${data.user_code}`)
+      authManager.setPendingAuth(id, data)
+    }
+  })
+
+  // FIX : On utilise 'login' (une seule fois) à la place de 'spawn' pour éviter d'empiler les anti-AFK
+  bots[id].bot.on('login', () => {
+    bots[id].status = 'connected'
+    addLog(id, `✅ ${bots[id].name} connecté avec succès !`)
+    authManager.setAuthSuccess(id)
+    startAntiAFK(id)
+  })
+
+  bots[id].bot.on('windowOpen', async (window) => {
+    if (bots[id].afkStatus !== 'searching') return
+
+    addLog(id, `📦 Menu AFK détecté (Slot ${AFK_BUTTON_SLOT}) — Clic...`)
+    freezeBot(id)
+    bots[id].afkStatus = 'teleporting'
+
+    setTimeout(async () => {
+      try {
+        if (bots[id] && bots[id].bot) {
+          // FIX : Utilisation de clickWindow natif (simpleClick n'existe pas)
+          await bots[id].bot.clickWindow(AFK_BUTTON_SLOT, 0, 0)
+          addLog(id, `⏳ Téléportation lancée — Immobile pendant 6s...`)
+        }
+
+        setTimeout(() => {
+          if (bots[id] && bots[id].afkStatus === 'teleporting') {
+            unfreezeBot(id)
+            bots[id].afkStatus = 'idle'
+            addLog(id, `✅ Statut AFK synchronisé.`)
+          }
+        }, 6000)
+
+      } catch (e) {
+        addLog(id, `⚠️ Erreur lors du clic : ${e.message}`)
+        unfreezeBot(id)
+        bots[id].afkStatus = 'idle'
+      }
+    }, 500)
+  })
+
+  bots[id].bot.on('message', (jsonMsg) => {
+    const msg = jsonMsg.toString().toLowerCase()
+    if (bots[id].afkStatus === 'teleporting' && (msg.includes('region is full') || msg.includes('area is full'))) {
+      addLog(id, `❌ Zone AFK saturée.`)
+      unfreezeBot(id)
+      bots[id].afkStatus = 'idle'
+    }
+  })
+
+  bots[id].bot.on('kicked', (reason) => {
+    cleanBotResources(id)
+    addLog(id, `❌ Expulsé : ${reason}`)
+    handleReconnect(id)
+  })
+
+  bots[id].bot.on('error', (err) => {
+    cleanBotResources(id)
+    addLog(id, `⚠️ Erreur réseau : ${err.message}`)
+    handleReconnect(id)
+  })
+
+  bots[id].bot.on('end', () => {
+    if (bots[id] && bots[id].status === 'stopped') return
+    cleanBotResources(id)
+    addLog(id, '🔌 Connexion interrompue.')
+    handleReconnect(id)
   })
 }
 
-async function startAuth(accountId) {
-  if (pendingAuths[accountId]) cancelAuth(accountId)
+function handleReconnect(id) {
+  if (!bots[id] || bots[id].status === 'stopped') return
+  bots[id].status = 'disconnected'
+  bots[id].reconnectTimer = setTimeout(() => startBot(id), 10000)
+  addLog(id, '🔄 Reconnexion automatique programmée dans 10s...')
+}
 
-  const deviceRes = await post('login.microsoftonline.com',
-    '/consumers/oauth2/v2.0/devicecode', {
-      client_id: CLIENT_ID,
-      scope: 'XboxLive.signin offline_access'
-    })
-
-  if (!deviceRes.device_code) {
-    throw new Error('Impossible de générer le code auprès de Microsoft.')
+function cleanBotResources(id) {
+  if (!bots[id]) return
+  if (bots[id].intervals) {
+    bots[id].intervals.forEach(clearInterval)
+    bots[id].intervals = []
   }
+  bots[id].afkStatus = 'idle'
+  bots[id].bot = null
+}
 
-  pendingAuths[accountId] = {
-    status: 'pending',
-    userCode: deviceRes.user_code,
-    link: deviceRes.verification_uri,
-    expiresAt: Date.now() + (deviceRes.expires_in * 1000),
-    interval: null
+function stopBot(id) {
+  if (!bots[id]) return
+  if (bots[id].reconnectTimer) { clearTimeout(bots[id].reconnectTimer); bots[id].reconnectTimer = null }
+  bots[id].status = 'stopped'
+  if (bots[id].bot) {
+    try { bots[id].bot.quit() } catch {}
   }
+  cleanBotResources(id)
+  bots[id].status = 'stopped'
+  addLog(id, '🛑 Bot mis à l\'arrêt.')
+}
 
-  pendingAuths[accountId].interval = setInterval(async () => {
-    if (!pendingAuths[accountId] || Date.now() > pendingAuths[accountId].expiresAt) {
-      if (pendingAuths[accountId]) pendingAuths[accountId].status = 'expired'
-      clearInterval(pendingAuths[accountId]?.interval)
-      return
+function startAntiAFK(id) {
+  if (!bots[id]) return
+  cleanBotResources(id)
+
+  // Saut (30s)
+  const jump = setInterval(() => {
+    if (bots[id] && bots[id].bot && bots[id].status === 'connected' && bots[id].afkStatus === 'idle') {
+      bots[id].bot.setControlState('jump', true)
+      setTimeout(() => { if (bots[id] && bots[id].bot) bots[id].bot.setControlState('jump', false) }, 500)
     }
+  }, 30000)
 
-    try {
-      const tokenRes = await post('login.microsoftonline.com',
-        '/consumers/oauth2/v2.0/token', {
-          grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-          client_id: CLIENT_ID,
-          device_code: deviceRes.device_code
-        })
+  // Regard (3m)
+  const look = setInterval(() => {
+    if (bots[id] && bots[id].bot && bots[id].status === 'connected' && bots[id].afkStatus === 'idle') {
+      try { bots[id].bot.look(bots[id].bot.entity.yaw + 0.5, 0) } catch {}
+    }
+  }, 180000)
 
-      if (tokenRes.access_token) {
-        pendingAuths[accountId].status = 'success'
-        clearInterval(pendingAuths[accountId].interval)
-
-        if (!fs.existsSync(TOKENS_DIR)) fs.mkdirSync(TOKENS_DIR, { recursive: true })
-
-        const tokenFile = path.join(TOKENS_DIR, `${accountId}.json`)
-        fs.writeFileSync(tokenFile, JSON.stringify({
-          access_token: tokenRes.access_token,
-          refresh_token: tokenRes.refresh_token,
-          expires_at: Date.now() + (tokenRes.expires_in * 1000)
-        }))
-
-        // Conservé 60 secondes en mémoire au lieu de 10 pour laisser le temps au web d'être notifié
-        setTimeout(() => { delete pendingAuths[accountId] }, 60000)
-      }
-    } catch {}
-  }, 5000)
-
-  return {
-    code: deviceRes.user_code,
-    link: pendingAuths[accountId].link,
-    expiresIn: deviceRes.expires_in
-  }
+  bots[id].intervals.push(jump, look)
 }
 
-function getAuthStatus(accountId) {
-  if (!pendingAuths[accountId]) return { status: 'none' }
-  const p = pendingAuths[accountId]
-  return {
-    status: p.status,
-    code: p.userCode,
-    link: p.link,
-    secondsLeft: Math.max(0, Math.floor((p.expiresAt - Date.now()) / 1000))
-  }
+function freezeBot(id) {
+  if (!bots[id] || !bots[id].bot) return
+  const b = bots[id].bot
+  ;['forward','back','left','right','jump','sneak','sprint'].forEach(s => { try { b.setControlState(s, false) } catch {} })
 }
 
-function cancelAuth(accountId) {
-  if (pendingAuths[accountId]) {
-    clearInterval(pendingAuths[accountId].interval)
-    delete pendingAuths[accountId]
-  }
+function unfreezeBot(id) { freezeBot(id) }
+
+function findAfk(id) {
+  if (!bots[id] || bots[id].status !== 'connected') return
+  bots[id].afkStatus = 'searching'
+  addLog(id, '🔍 Commande /afk envoyée...')
+  bots[id].bot.chat('/afk')
 }
 
-module.exports = { startAuth, getAuthStatus, cancelAuth }
+function goHome(id, num) {
+  if (!bots[id] || !bots[id].bot || bots[id].status !== 'connected') return
+  bots[id].bot.chat(`/home ${num}`)
+  addLog(id, `🏠 Commande envoyée : /home ${num}`)
+}
+
+module.exports = { addAccount, removeAccount, startBot, stopBot, getAll, findAfk, goHome, getTokensDir }
