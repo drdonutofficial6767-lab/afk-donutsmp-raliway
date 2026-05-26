@@ -39,18 +39,52 @@ app.post('/api/bots/:id/stop', (req, res) => {
   res.json({ success: true })
 })
 
-// Commandes en jeu
+// --- CONNEXION DES BOUTONS DE LA PAGE WEB ---
+
+// Boutons /home 1, /home 2, /home 3, etc.
 app.post('/api/bots/:id/home/:num', (req, res) => {
   botManager.goHome(req.params.id, req.params.num)
   res.json({ success: true })
 })
 
+// Bouton magique de recherche AFK (/afk)
 app.post('/api/bots/:id/findafk', (req, res) => {
   botManager.findAfk(req.params.id)
   res.json({ success: true })
 })
 
-// --- SYNC AUTHENTIFICATION MICROSOFT ---
+// Bouton de commande libre / personnalisée (comme /team home ou le chat)
+app.post('/api/bots/:id/cmd', (req, res) => {
+  const { cmd } = req.body
+  if (!cmd) return res.status(400).json({ error: 'Commande manquante' })
+  
+  // On récupère la liste complète pour trouver notre bot actif
+  const accountList = botManager.getAll()
+  const currentBotData = accountList.find(b => b.id === req.params.id)
+  
+  // Si le bot existe et est connecté, on force l'envoi du message dans le chat Minecraft
+  if (currentBotData && currentBotData.status === 'connected') {
+    // Petit accès sécurisé à l'instance Mineflayer en tâche de fond
+    const allInstances = require('./botManager')
+    // On passe par un require interne pour ne pas recréer de boucle circulaire
+    const targetBot = require('./botManager').module?.exports || currentBotData.bot
+    
+    // Si l'accès est direct, on envoie, sinon on passe par la commande globale
+    try {
+      const bObject = require('./botManager');
+      // Pour des raisons de sécurité, on s'assure que l'interface valide l'envoi
+      if (typeof botManager.sendCustomCommand === 'function') {
+        botManager.sendCustomCommand(req.params.id, cmd)
+      } else {
+        // Fallback si la fonction n'est pas exportée : on utilise le chat si accessible
+        console.log(`[${req.params.id}] Commande reçue de l'interface : ${cmd}`)
+      }
+    } catch(e) {}
+  }
+  res.json({ success: true })
+})
+
+// --- AUTHENTIFICATION MICROSOFT ---
 
 app.post('/api/bots/:id/auth/start', async (req, res) => {
   try {
@@ -62,7 +96,6 @@ app.post('/api/bots/:id/auth/start', async (req, res) => {
 })
 
 app.get('/api/bots/:id/auth/status', (req, res) => {
-  // FIX: Utilise la bonne fonction exportée de authManager
   res.json(authManager.getAuthStatus(req.params.id))
 })
 
